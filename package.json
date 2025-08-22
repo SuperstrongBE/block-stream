@@ -1,0 +1,17 @@
+{
+  "name": "block-stream",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@eosrio/hyperion-stream-client": "^1.0.3",
+    "add": "^2.0.6",
+    "eosjs": "^22.1.0"
+  }
+}
