@@ -202,6 +202,57 @@ class SocketTester {
     );
   }
 
+  // Decode table row value using contract ABI
+  decodeTableRowValue(contractName, tableName, valueData) {
+    try {
+      if (!valueData || typeof valueData !== "object") return valueData;
+
+      // Convert object data to Uint8Array
+      const dataArray = new Uint8Array(Object.keys(valueData).length);
+      Object.keys(valueData).forEach(key => {
+        dataArray[parseInt(key)] = valueData[key];
+      });
+
+      // Try to decode with contract ABI if available
+      if (this.contractTypes.has(contractName)) {
+        const types = this.contractTypes.get(contractName);
+        const contractAbi = this.contractAbis.get(contractName);
+
+        // Find the table structure in the ABI
+        const tableAbi = contractAbi.tables?.find(t => t.name === tableName);
+        if (tableAbi && tableAbi.type) {
+          const buffer = new SerialBuffer({
+            textEncoder: txEnc,
+            textDecoder: txDec,
+            array: dataArray,
+          });
+
+          const decoded = Serialize.getType(types, tableAbi.type).deserialize(
+            buffer,
+            new SerializerState({bytesAsUint8Array: true})
+          );
+
+          return decoded;
+        }
+      }
+
+      // If no ABI or decoding fails, return hex representation
+      return {
+        hex: Array.from(dataArray)
+          .map(b => b.toString(16).padStart(2, "0"))
+          .join(""),
+        note: `Unable to decode table row for ${contractName}.${tableName} - ABI not available or table structure not found`,
+      };
+    } catch (e) {
+      return {
+        error: e.message,
+        hex: Array.from(Object.keys(valueData))
+          .map(k => valueData[k].toString(16).padStart(2, "0"))
+          .join(""),
+      };
+    }
+  }
+
   // Decode action data using contract ABI
   decodeActionData(account, name, data) {
     try {
@@ -271,21 +322,9 @@ class SocketTester {
   shouldProcessTable(contract, table) {
     if (this.whitelistedTables.size === 0) return true; // No filter = process all
 
-    console.log(`[SOCKET] CONTRACT shouldProcessTable: ${contract}`);
-    console.log(`[SOCKET] TABLE shouldProcessTable: ${table}`);
     const contractTables = this.whitelistedTables.get(contract);
-    console.log(
-      `## [SOCKET] CONTRACT TABLES ARRAY: ${JSON.stringify(
-        contractTables?.entries().toArray()
-      )}`
-    );
     if (!contractTables) return false; // Contract not in whitelist
 
-    console.log(
-      `?? [SOCKET] TABLE SHOUD BE PROCESSED ${contractTables.has(
-        table
-      )}: ${contract}.${table}`
-    );
     return contractTables.has(table);
   }
 
@@ -314,7 +353,7 @@ class SocketTester {
               this.extractTablesFromContractRow(deltaData);
             console.log(
               `[SOCKET] Extracted tables: ${extractedTables
-                .map(t => t.table)
+                .map(t => `${t.contract}.${t.table}`)
                 .join(", ")}`
             );
             if (extractedTables.length > 0) {
@@ -326,25 +365,23 @@ class SocketTester {
             continue;
           }
 
-          // For system tables, use the existing mapping
-          let contract = this.getContractForTable(table);
+          // For any other table, check if it's explicitly whitelisted
+          const matchingContract = this.findContractForTable(table);
+          if (matchingContract) {
+            console.log(
+              `[SOCKET] Processing whitelisted table: ${matchingContract}.${table}`
+            );
 
-          if (contract !== "unknown") {
-            // Apply whitelist filter for system tables
-            if (this.shouldProcessTable(contract, table)) {
-              console.log(
-                `[SOCKET] Processing system table: ${contract}.${table}`
-              );
-
-              decodedDeltas.push({
-                type: deltaType,
-                contract,
-                table,
-                data: deltaData,
-                processed: true,
-                filtered: true,
-              });
-            }
+            decodedDeltas.push({
+              type: deltaType,
+              contract: matchingContract,
+              table,
+              data: deltaData,
+              processed: true,
+              filtered: true,
+            });
+          } else {
+            console.log(`[SOCKET] Skipping non-whitelisted table: ${table}`);
           }
         }
       } catch (e) {
@@ -360,57 +397,14 @@ class SocketTester {
     return decodedDeltas;
   }
 
-  // Map table names to their contracts
-  getContractForTable(tableName) {
-    // System tables that belong to eosio
-    const systemTables = new Set([
-      "contract_row",
-      "contract_index64",
-      "contract_index128",
-      "contract_index256",
-      "contract_index_double",
-      "contract_index_long_double",
-      "resource_usage",
-      "resource_limits_state",
-      "resource_limits_config",
-      "global",
-      "global2",
-      "global3",
-      "global4",
-      "globalram",
-      "globalsd",
-      "globalsxpr",
-      "producers",
-      "producers2",
-      "voters",
-      "votersxpr",
-      "delband",
-      "delxpr",
-      "refunds",
-      "refundsxpr",
-      "rammarket",
-      "namebids",
-      "bidrefunds",
-      "userres",
-      "usersram",
-      "rexbal",
-      "rexfund",
-      "rexpool",
-      "rexqueue",
-      "rexretpool",
-      "retbuckets",
-      "cpuloan",
-      "netloan",
-      "abihash",
-    ]);
-
-    if (systemTables.has(tableName)) {
-      return "eosio";
+  // Generic helper to find which whitelisted contract contains this table
+  findContractForTable(tableName) {
+    for (const [contract, tables] of this.whitelistedTables.entries()) {
+      if (tables.has(tableName)) {
+        return contract;
+      }
     }
-
-    // For non-system tables, we might need additional logic to determine the contract
-    // For now, assume they're user contract tables and return a default
-    return "unknown";
+    return null; // Table not found in any whitelisted contract
   }
 
   // Extract table data from contract_row deltas
@@ -433,47 +427,43 @@ class SocketTester {
 
           // Deserialize the contract row data using the ship ABI
           const contractRowData = this.deserialize("contract_row", dataArray);
-          if (contractRowData[1] && contractRowData[1].table == "votersxpr") {
-            console.warn(`[SOCKET] Row: ${JSON.stringify(contractRowData[1])}`);
-            console.warn(`[SOCKET] Row: ${JSON.stringify(contractRowData)}`);
-          }
 
-          if (contractRowData[1] && contractRowData[1].table == "accounts") {
-            console.warn(`[SOCKET] Row: ${JSON.stringify(contractRowData[1])}`);
-            console.warn(`[SOCKET] Row: ${JSON.stringify(contractRowData)}`);
-            console.warn(
-              `[SOCKET] Row: ${JSON.stringify(contractRowData[1].data)}`
-            );
-          }
-
-          if (contractRowData && contractRowData.table) {
-            const tableName = contractRowData.table;
-            const contractName = contractRowData.code;
-
-            console.log(
-              `[DEBUG] Found contract row: ${contractName}.${tableName}`
-            );
+          if (
+            contractRowData &&
+            contractRowData[1] &&
+            contractRowData[1].table
+          ) {
+            const tableName = contractRowData[1].table;
+            const contractName = contractRowData[1].code;
 
             // Apply whitelist filter for the extracted table
-            //
             if (this.shouldProcessTable(contractName, tableName)) {
               console.log(
                 `[SOCKET] Found whitelisted table: ${contractName}.${tableName}`
               );
 
+              // Decode the table row value if we have the ABI
+              let decodedValue = contractRowData[1].value;
+              if (this.contractTypes.has(contractName)) {
+                decodedValue = this.decodeTableRowValue(
+                  contractName,
+                  tableName,
+                  contractRowData[1].value
+                );
+              }
+
               extractedTables.push({
                 type: "table_delta_v0",
                 contract: contractName,
                 table: tableName,
-                data: contractRowData,
+                data: {
+                  ...contractRowData[1],
+                  value: decodedValue, // Replace binary value with decoded JSON
+                },
                 processed: true,
                 filtered: true,
                 extracted_from: "contract_row",
               });
-            } else {
-              console.log(
-                `[SOCKET] Skipping table: ${contractName}.${tableName}`
-              );
             }
           }
         }
@@ -481,7 +471,6 @@ class SocketTester {
         // Continue with other rows even if one fails
       }
     }
-    console.log(extractedTables);
     return extractedTables;
   }
 
@@ -797,13 +786,9 @@ const tableLoggerMicroService = ({
 }: MicroServiceContext) => {
   if ($delta && $table) {
     console.log(
-      `[LOGGER] Delta found - Table: ${$table}, Contract: ${$delta.contract}`
+      `[MICRO] Delta found - Table: ${$table}, Contract: ${$delta.contract}`
     );
-    console.log(`[LOGGER] Delta details:`, JSON.stringify($delta, null, 2));
-  } else if ($action) {
-    console.log(`[LOGGER] Action found - ${$action.account}.${$action.name}`);
-  } else {
-    console.log(`[LOGGER] Block ${$block.block_number} - no delta or action`);
+    console.log(`[MICRO] Delta details:`, JSON.stringify($delta, null, 2));
   }
 
   return {$block, $delta, $action, $table};
@@ -814,7 +799,7 @@ const tester = new SocketTester({
   socketAddress: WS_SERVER,
   contracts: ["eosio", "futureshit"], // Whitelisted contracts
   tables: {
-    eosio: ["votersxpr"], // Only these tables for eosio.token
+    eosio: ["voters"], // Only these tables for eosio.token
     futureshit: ["accounts"], // Only accounts table for xtokens
   },
 });
