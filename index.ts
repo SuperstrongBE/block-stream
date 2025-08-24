@@ -87,9 +87,6 @@ type CustomLogger = winston.Logger & {
 const txEnc = new TextEncoder();
 const txDec = new TextDecoder();
 
-const WS_SERVER = "ws://testnet.rockerone.io:8080";
-const RPC_ENDPOINT = "https://testnet.rockerone.io";
-
 // Types for the microservice architecture
 interface BlockData {
   block_number: number;
@@ -142,6 +139,7 @@ interface ContractConfig {
 
 interface SocketTesterConfig {
   socketAddress: string;
+  rpcAddress: string;
   contracts?: Record<string, ContractConfig>; // New enhanced format
   // Legacy support (deprecated)
   tables?: Record<string, string[]>;
@@ -179,6 +177,7 @@ export class BlockStreamClient {
   // Connect to the State-History Plugin
   constructor({
     socketAddress,
+    rpcAddress,
     contracts,
     tables = {}, // Legacy support
     enableDebug = false,
@@ -187,7 +186,7 @@ export class BlockStreamClient {
   }: SocketTesterConfig) {
     this.socketAddress = socketAddress;
     this.enableDebug = enableDebug;
-    this.rpc = new JsonRpc(RPC_ENDPOINT, {fetch});
+    this.rpc = new JsonRpc(rpcAddress, {fetch});
 
     // Setup Winston logger with custom levels
     const customLevels = {
@@ -266,47 +265,54 @@ export class BlockStreamClient {
     if (contracts) {
       // New enhanced format
       this.logger.info("Using enhanced contract configuration format");
-      
+
       Object.entries(contracts).forEach(([contractName, config]) => {
         // Add contract to whitelist
         this.whitelistedContracts.add(contractName);
-        
+
         // Handle tables configuration
         if (config.tables) {
           if (config.tables.includes("*")) {
             // Wildcard - allow all tables for this contract
             this.wildcardTables.add(contractName);
-            this.logger.socket("Contract configured with wildcard table access", { contract: contractName });
+            this.logger.socket(
+              "Contract configured with wildcard table access",
+              {contract: contractName}
+            );
           } else {
             // Specific tables
             this.whitelistedTables.set(contractName, new Set(config.tables));
-            this.logger.socket("Contract configured with specific tables", { 
-              contract: contractName, 
-              tables: config.tables 
+            this.logger.socket("Contract configured with specific tables", {
+              contract: contractName,
+              tables: config.tables,
             });
           }
         }
-        
+
         // Handle actions configuration
         if (config.actions) {
           this.whitelistedActions.set(contractName, new Set(config.actions));
-          this.logger.socket("Contract configured with specific actions", { 
-            contract: contractName, 
-            actions: config.actions 
+          this.logger.socket("Contract configured with specific actions", {
+            contract: contractName,
+            actions: config.actions,
           });
         }
       });
     } else if (legacyTables && Object.keys(legacyTables).length > 0) {
       // Legacy format support
-      this.logger.warn("Using legacy table configuration format - consider upgrading to enhanced format");
-      
+      this.logger.warn(
+        "Using legacy table configuration format - consider upgrading to enhanced format"
+      );
+
       Object.entries(legacyTables).forEach(([contract, contractTables]) => {
         this.whitelistedContracts.add(contract);
         this.whitelistedTables.set(contract, new Set(contractTables));
       });
     } else {
       // No filtering - process all contracts/tables
-      this.logger.info("No contract filtering configured - processing all contracts and tables");
+      this.logger.info(
+        "No contract filtering configured - processing all contracts and tables"
+      );
     }
   }
 
@@ -535,14 +541,14 @@ export class BlockStreamClient {
   shouldProcessAction(account: string, name: string): boolean {
     // If no contracts configured, process all
     if (this.whitelistedContracts.size === 0) return true;
-    
+
     // Contract must be whitelisted
     if (!this.whitelistedContracts.has(account)) return false;
-    
+
     // If no specific actions configured for this contract, allow all actions
     const contractActions = this.whitelistedActions.get(account);
     if (!contractActions) return true;
-    
+
     // Check if specific action is whitelisted
     return contractActions.has(name);
   }
@@ -550,18 +556,22 @@ export class BlockStreamClient {
   // Check if table delta should be processed based on whitelist
   shouldProcessTable(contract: string, table: string): boolean {
     // If no contracts configured, process all
-    if (this.whitelistedContracts.size === 0 && this.whitelistedTables.size === 0) return true;
-    
+    if (
+      this.whitelistedContracts.size === 0 &&
+      this.whitelistedTables.size === 0
+    )
+      return true;
+
     // Contract must be whitelisted
     if (!this.whitelistedContracts.has(contract)) return false;
-    
+
     // Check if contract has wildcard table access
     if (this.wildcardTables.has(contract)) return true;
-    
+
     // Check specific table whitelist
     const contractTables = this.whitelistedTables.get(contract);
     if (!contractTables) return true; // Contract whitelisted but no specific tables = allow all
-    
+
     return contractTables.has(table);
   }
 
@@ -1075,18 +1085,21 @@ const tableLoggerMicroService = ({
   return {$block, $delta, $action, $table, $logger};
 };
 
+const WS_SERVER = "ws://testnet.rockerone.io:8080";
+const RPC_ENDPOINT = "https://testnet.rockerone.io";
 // Example usage with enhanced microservice architecture
 const tester = new BlockStreamClient({
   socketAddress: WS_SERVER,
+  rpcAddress: RPC_ENDPOINT,
   contracts: {
-    "eosio": {
+    eosio: {
       tables: ["voters"], // Only voters table
-      actions: ["voteproducer"] // Only voteproducer actions
+      actions: ["voteproducer"], // Only voteproducer actions
     },
-    "futureshit": {
+    futureshit: {
       tables: ["*"], // All tables (wildcard)
       // No actions specified = no action filtering for this contract
-    }
+    },
   },
   enableDebug: true, // Enable debug logging to console
   logFile: "stream-block-client.log", // Log file location
