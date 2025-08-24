@@ -110,7 +110,6 @@ const client = new BlockStreamClient({
 const client = new BlockStreamClient({
   socketAddress: "ws://your-node:8080",
   tables: {
-    eosio: ["voters"],
     "eosio.token": ["accounts"],
   },
 });
@@ -201,17 +200,6 @@ contracts: {
 }
 ```
 
-### Governance Tracking
-
-```typescript
-contracts: {
-  "eosio": {
-    tables: ["voters", "producers"],
-    actions: ["voteproducer", "regproducer"]
-  }
-}
-```
-
 ### Smart Contract Analytics
 
 ```typescript
@@ -272,8 +260,6 @@ bun build index.ts --target node --outdir dist
 
 - **XPRNetwork Mainnet**: `wss://mainnet.rockerone.io:8080`
 - **XPRNetwork Testnet**: `ws://testnet.rockerone.io:8080`
-- **EOS Mainnet**: Configure your State History endpoint
-- **Other EOSIO chains**: Any chain with State History Plugin enabled
 
 ## 📝 Requirements
 
