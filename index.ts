@@ -1,7 +1,7 @@
 // noinspection JSUnusedGlobalSymbols,JSUnusedGlobalSymbols,JSUnusedGlobalSymbols,JSCheckFunctionSignatures,JSCheckFunctionSignatures,JSUnresolvedVariable,JSUnresolvedVariable
 
 const {Serialize} = require("eosjs");
-import WebSocket from "ws";
+import * as WebSocket from "ws";
 const {
   SerialBuffer,
   SerializerState,
@@ -11,7 +11,72 @@ const {
 const {JsonRpc} = require("eosjs");
 const fetch = require("node-fetch");
 import {Subject} from "rxjs";
-import winston from "winston";
+import * as winston from "winston";
+
+// EOSIO State History types
+interface EOSIOAbi {
+  version: string;
+  types: Array<{ new_type_name: string; type: string }>;
+  structs: Array<{
+    name: string;
+    base: string;
+    fields: Array<{ name: string; type: string }>;
+  }>;
+  actions: Array<{ name: string; type: string; ricardian_contract?: string }>;
+  tables: Array<{ name: string; type: string; index_type: string; key_names: string[]; key_types: string[] }>;
+  ricardian_clauses?: Array<{ id: string; body: string }>;
+  variants?: Array<{ name: string; types: string[] }>;
+}
+
+interface ContractAbiResponse {
+  account_name: string;
+  abi: EOSIOAbi;
+}
+
+interface SerializationTypes {
+  [key: string]: any; // eosjs serialization types - complex internal structure
+}
+
+interface StateHistoryRow {
+  present: boolean;
+  data?: Record<string, number>; // Binary data as object with numeric keys
+}
+
+interface TableDeltaData {
+  name: string;
+  rows?: StateHistoryRow[];
+}
+
+interface ContractRowData {
+  code: string;
+  scope: string;
+  table: string;
+  primary_key: string;
+  payer: string;
+  value: Record<string, number>; // Binary data as object
+}
+
+interface BlockPosition {
+  block_num: number;
+  block_id: string;
+}
+
+interface GetBlocksResponse {
+  head: BlockPosition;
+  last_irreversible: BlockPosition;
+  this_block: BlockPosition;
+  prev_block?: BlockPosition;
+  block?: Uint8Array;
+  traces?: Uint8Array;
+  deltas?: Uint8Array;
+}
+
+// Custom Logger type that includes our custom log levels
+// We can't extend winston.Logger due to method signature incompatibilities
+type CustomLogger = winston.Logger & {
+  socket(message: string, meta?: any): winston.Logger;
+  micro(message: string, meta?: any): winston.Logger;
+}
 
 const txEnc = new TextEncoder();
 const txDec = new TextDecoder();
@@ -59,7 +124,7 @@ interface MicroServiceContext {
   $delta?: TableDelta;
   $action?: ActionData;
   $table?: string; // table name from delta
-  $logger: winston.Logger;
+  $logger: CustomLogger;
 }
 
 type MicroService = (context: MicroServiceContext) => MicroServiceContext;
@@ -70,23 +135,31 @@ interface SocketTesterConfig {
   tables?: Record<string, string[]>;
   enableDebug?: boolean;
   logFile?: string;
+  logLevel?:
+    | "error"
+    | "warn"
+    | "info"
+    | "socket"
+    | "micro"
+    | "debug"
+    | "verbose";
 }
 
 class SocketTester {
-  abi: any = null; // Protocol ABI from State History
-  types: any = null; // Serialization types from ABI
+  abi: EOSIOAbi | null = null; // Protocol ABI from State History
+  types: SerializationTypes | null = null; // Serialization types from ABI
   tables = new Map<string, string>();
-  contractAbis = new Map<string, any>();
-  contractTypes = new Map<string, any>();
+  contractAbis = new Map<string, EOSIOAbi>();
+  contractTypes = new Map<string, SerializationTypes>();
   whitelistedContracts = new Set<string>();
   whitelistedTables = new Map<string, Set<string>>(); // Map<contract, Set<table>>
-  rpc: any = null; // JsonRpc from eosjs
+  rpc: any = null; // JsonRpc from eosjs - external library without proper types
   receivedCounter: number = 0;
-  ws: WebSocket;
+  ws!: WebSocket; // Initialized in start() method
   private subject = new Subject<MicroServiceContext>();
   private microservices: MicroService[] = [];
   private socketAddress: string;
-  private logger: winston.Logger;
+  private logger: CustomLogger;
   private enableDebug: boolean;
 
   // Connect to the State-History Plugin
@@ -95,41 +168,77 @@ class SocketTester {
     contracts = [],
     tables = {},
     enableDebug = false,
-    logFile = "hyperion-client.log"
+    logFile = "hyperion-client.log",
+    logLevel = enableDebug ? "verbose" : "info",
   }: SocketTesterConfig) {
     this.socketAddress = socketAddress;
     this.enableDebug = enableDebug;
     this.rpc = new JsonRpc(RPC_ENDPOINT, {fetch});
 
-    // Setup Winston logger
+    // Setup Winston logger with custom levels
+    const customLevels = {
+      levels: {
+        error: 0,
+        warn: 1,
+        info: 2,
+        socket: 3, // Socket-level debugging
+        micro: 4, // Microservice-level debugging
+        debug: 5, // General debugging
+        verbose: 6, // Very detailed logging
+      },
+      colors: {
+        error: "red",
+        warn: "yellow",
+        info: "green",
+        socket: "cyan",
+        micro: "magenta",
+        debug: "blue",
+        verbose: "gray",
+      },
+    };
+
+    winston.addColors(customLevels.colors);
+
     const logFormat = winston.format.combine(
       winston.format.timestamp(),
-      winston.format.errors({ stack: true }),
+      winston.format.errors({stack: true}),
       winston.format.json()
     );
 
-    const transports: winston.transport[] = [
-      new winston.transports.File({ 
-        filename: logFile,
-        level: enableDebug ? 'debug' : 'info'
+    const consoleFormat = winston.format.combine(
+      winston.format.colorize(),
+      winston.format.timestamp({format: "HH:mm:ss"}),
+      winston.format.printf(({timestamp, level, message, ...meta}) => {
+        const metaStr = Object.keys(meta).length
+          ? ` ${JSON.stringify(meta)}`
+          : "";
+        return `${timestamp} [${level}]: ${message}${metaStr}`;
       })
+    );
+
+    const transports: winston.transport[] = [
+      new winston.transports.File({
+        filename: logFile,
+        level: logLevel,
+      }),
     ];
 
     // Add console transport only if debug is enabled
     if (enableDebug) {
-      transports.push(new winston.transports.Console({
-        format: winston.format.combine(
-          winston.format.colorize(),
-          winston.format.simple()
-        )
-      }));
+      transports.push(
+        new winston.transports.Console({
+          format: consoleFormat,
+          level: logLevel,
+        })
+      );
     }
 
     this.logger = winston.createLogger({
-      level: enableDebug ? 'debug' : 'info',
+      levels: customLevels.levels,
+      level: logLevel,
       format: logFormat,
-      transports
-    });
+      transports,
+    }) as unknown as CustomLogger;
 
     // Setup contract whitelist
     this.whitelistedContracts = new Set<string>(contracts);
@@ -150,7 +259,10 @@ class SocketTester {
   // Start the WebSocket connection and process through microservice chain
   start(): void {
     this.ws = new WebSocket(this.socketAddress, {perMessageDeflate: false});
-    this.ws.on("message", data => this.onMessage(data));
+    this.ws.on("message", (data: WebSocket.RawData) => {
+      const buffer = data instanceof ArrayBuffer ? Buffer.from(data) : data as Buffer;
+      this.onMessage(buffer);
+    });
 
     // Subscribe to the stream and process through microservice chain
     this.subject.subscribe(context => {
@@ -166,7 +278,10 @@ class SocketTester {
       try {
         currentContext = microservice(currentContext);
       } catch (error) {
-        this.logger.error("Microservice error", { error: error.message, stack: error.stack });
+        this.logger.error("Microservice error", {
+          error: error.message,
+          stack: error.stack,
+        });
         break;
       }
     }
@@ -178,14 +293,14 @@ class SocketTester {
   }
 
   // Convert JSON to binary. type identifies one of the types in this.types.
-  serialize(type, value) {
+  serialize(type: string, value: any): Uint8Array {
     const buffer = new SerialBuffer({textEncoder: txEnc, textDecoder: txDec});
     Serialize.getType(this.types, type).serialize(buffer, value);
     return buffer.asUint8Array();
   }
 
   // Convert binary to JSON. type identifies one of the types in this.types.
-  deserialize(type, array) {
+  deserialize(type: string, array: Uint8Array): any {
     const buffer = new SerialBuffer({
       textEncoder: txEnc,
       textDecoder: txDec,
@@ -198,13 +313,13 @@ class SocketTester {
   }
 
   // Fetch contract ABI from blockchain
-  async fetchContractAbi(contract) {
+  async fetchContractAbi(contract: string): Promise<EOSIOAbi | null> {
     try {
       if (this.contractAbis.has(contract)) {
         return this.contractAbis.get(contract);
       }
 
-      this.logger.debug("Fetching ABI for contract", { contract });
+      this.logger.socket("Fetching ABI for contract", {contract});
       const abiResponse = await this.rpc.get_abi(contract);
 
       if (abiResponse && abiResponse.abi) {
@@ -214,31 +329,35 @@ class SocketTester {
         );
         this.contractAbis.set(contract, abiResponse.abi);
         this.contractTypes.set(contract, contractTypes);
-        this.logger.info("ABI loaded successfully", { contract });
+        this.logger.info("ABI loaded successfully", {contract});
         return abiResponse.abi;
       }
 
       return null;
     } catch (e) {
-      this.logger.warn("Failed to fetch ABI", { contract, error: e.message });
+      this.logger.warn("Failed to fetch ABI", {contract, error: e.message});
       return null;
     }
   }
 
   // Initialize contract ABIs for whitelisted contracts
-  async initializeContractAbis() {
-    this.logger.info("Loading ABIs for whitelisted contracts", { count: this.whitelistedContracts.size });
+  async initializeContractAbis(): Promise<void> {
+    this.logger.info("Loading ABIs for whitelisted contracts", {
+      count: this.whitelistedContracts.size,
+    });
 
     const promises = Array.from(this.whitelistedContracts).map(contract =>
       this.fetchContractAbi(contract)
     );
 
     await Promise.allSettled(promises);
-    this.logger.info("ABI initialization complete", { loaded: this.contractAbis.size });
+    this.logger.info("ABI initialization complete", {
+      loaded: this.contractAbis.size,
+    });
   }
 
   // Decode table row value using contract ABI
-  decodeTableRowValue(contractName, tableName, valueData) {
+  decodeTableRowValue(contractName: string, tableName: string, valueData: Record<string, number>): any {
     try {
       if (!valueData || typeof valueData !== "object") return valueData;
 
@@ -289,7 +408,7 @@ class SocketTester {
   }
 
   // Decode action data using contract ABI
-  decodeActionData(account, name, data) {
+  decodeActionData(account: string, name: string, data: Uint8Array): any {
     try {
       if (!data || data.length === 0) return null;
 
@@ -348,13 +467,13 @@ class SocketTester {
   }
 
   // Check if action should be processed based on whitelist
-  shouldProcessAction(account, name) {
+  shouldProcessAction(account: string, name: string): boolean {
     if (this.whitelistedContracts.size === 0) return true; // No filter = process all
     return this.whitelistedContracts.has(account);
   }
 
   // Check if table delta should be processed based on whitelist
-  shouldProcessTable(contract, table) {
+  shouldProcessTable(contract: string, table: string): boolean {
     if (this.whitelistedTables.size === 0) return true; // No filter = process all
 
     const contractTables = this.whitelistedTables.get(contract);
@@ -364,7 +483,7 @@ class SocketTester {
   }
 
   // Process and decode table deltas with filtering
-  processTableDeltas(deltas) {
+  processTableDeltas(deltas: Array<[string, TableDeltaData]>): TableDelta[] {
     if (!deltas || deltas.length === 0) return [];
 
     const decodedDeltas = [];
@@ -379,12 +498,18 @@ class SocketTester {
 
           // Special handling for contract_row - this contains user contract table data
           if (table === "contract_row") {
-            this.logger.debug("Processing contract_row", { rows: deltaData.rows ? deltaData.rows.length : 0 });
+            this.logger.socket("Processing contract_row", {
+              rows: deltaData.rows ? deltaData.rows.length : 0,
+            });
             const extractedTables =
               this.extractTablesFromContractRow(deltaData);
-            this.logger.debug("Extracted tables from contract_row", { tables: extractedTables.map(t => `${t.contract}.${t.table}`) });
+            this.logger.socket("Extracted tables from contract_row", {
+              tables: extractedTables.map(t => `${t.contract}.${t.table}`),
+            });
             if (extractedTables.length > 0) {
-              this.logger.info("Tables extracted from contract_row", { count: extractedTables.length });
+              this.logger.info("Tables extracted from contract_row", {
+                count: extractedTables.length,
+              });
             }
             decodedDeltas.push(...extractedTables);
             continue;
@@ -393,7 +518,10 @@ class SocketTester {
           // For any other table, check if it's explicitly whitelisted
           const matchingContract = this.findContractForTable(table);
           if (matchingContract) {
-            this.logger.info("Processing whitelisted table", { contract: matchingContract, table });
+            this.logger.info("Processing whitelisted table", {
+              contract: matchingContract,
+              table,
+            });
 
             decodedDeltas.push({
               type: deltaType,
@@ -404,11 +532,14 @@ class SocketTester {
               filtered: true,
             });
           } else {
-            this.logger.debug("Skipping non-whitelisted table", { table });
+            this.logger.socket("Skipping non-whitelisted table", {table});
           }
         }
       } catch (e) {
-        this.logger.error("Error processing delta", { error: e.message, stack: e.stack });
+        this.logger.error("Error processing delta", {
+          error: e.message,
+          stack: e.stack,
+        });
         decodedDeltas.push({
           error: e.message,
           raw: delta,
@@ -421,8 +552,8 @@ class SocketTester {
   }
 
   // Generic helper to find which whitelisted contract contains this table
-  findContractForTable(tableName) {
-    for (const [contract, tables] of this.whitelistedTables.entries()) {
+  findContractForTable(tableName: string): string | null {
+    for (const [contract, tables] of Array.from(this.whitelistedTables.entries())) {
       if (tables.has(tableName)) {
         return contract;
       }
@@ -431,11 +562,11 @@ class SocketTester {
   }
 
   // Extract table data from contract_row deltas
-  extractTablesFromContractRow(deltaData) {
+  extractTablesFromContractRow(deltaData: TableDeltaData): TableDelta[] {
     const extractedTables = [];
 
     if (!deltaData.rows || deltaData.rows.length === 0) {
-      this.logger.debug("No rows in contract_row");
+      this.logger.socket("No rows in contract_row");
       return extractedTables;
     }
 
@@ -461,7 +592,10 @@ class SocketTester {
 
             // Apply whitelist filter for the extracted table
             if (this.shouldProcessTable(contractName, tableName)) {
-              this.logger.info("Found whitelisted table in contract_row", { contract: contractName, table: tableName });
+              this.logger.info("Found whitelisted table in contract_row", {
+                contract: contractName,
+                table: tableName,
+              });
 
               // Decode the table row value if we have the ABI
               let decodedValue = contractRowData[1].value;
@@ -496,20 +630,23 @@ class SocketTester {
   }
 
   // Serialize a request and send it to the plugin
-  send(request) {
+  send(request: [string, any]): void {
     this.ws.send(this.serialize("request", request));
   }
 
   // Receive a message
-  async onMessage(data) {
+  async onMessage(data: Buffer): Promise<void> {
     try {
       if (!this.abi) {
         // First message is the protocol ABI
-        this.abi = JSON.parse(data);
+        this.abi = JSON.parse(data.toString());
 
         this.logger.info("Protocol ABI received");
         for (const struct of this.abi.structs) {
-          this.logger.debug("ABI struct", { name: struct.name, fields: struct.fields });
+          this.logger.socket("ABI struct", {
+            name: struct.name,
+            fields: struct.fields,
+          });
         }
 
         this.types = getTypesFromAbi(createInitialTypes(), this.abi);
@@ -524,26 +661,30 @@ class SocketTester {
 
         this.send(["get_status_request_v0", {}]);
       } else {
-        const [type, response] = this.deserialize("result", data);
+        const dataArray = new Uint8Array(data);
+        const [type, response] = this.deserialize("result", dataArray);
 
         if (this[type]) {
           this[type](response);
         } else {
-          this.logger.warn("Unhandled message type", { type });
+          this.logger.warn("Unhandled message type", {type});
         }
 
         // Ack Block
         this.send(["get_blocks_ack_request_v0", {num_messages: 1}]);
       }
     } catch (e) {
-      this.logger.error("WebSocket message processing error", { error: e.message, stack: e.stack });
+      this.logger.error("WebSocket message processing error", {
+        error: e.message,
+        stack: e.stack,
+      });
       process.exit(1);
     }
   }
 
   // Report status
 
-  get_status_result_v0(response) {
+  get_status_result_v0(response: { head: any; last_irreversible: any; chain_id: string }): void {
     // request from head block
     this.receivedCounter = 0;
     this.send([
@@ -640,11 +781,15 @@ class SocketTester {
         }
       }
     } catch (e) {
-      this.logger.error("Block processing error", { block: block_num, error: e.message, stack: e.stack });
+      this.logger.error("Block processing error", {
+        block: block_num,
+        error: e.message,
+        stack: e.stack,
+      });
     }
   }
 
-  get_blocks_result_v0(response) {
+  get_blocks_result_v0(response: GetBlocksResponse): void {
     const block_num = response.this_block.block_num;
     this.receivedCounter++;
 
@@ -725,9 +870,14 @@ class SocketTester {
       // Process table deltas
       if (response.deltas && response.deltas.length > 0) {
         const deltas = this.deserialize("table_delta[]", response.deltas);
-        this.logger.debug("Block deltas count", { block: block_num, deltas: deltas.length });
+        this.logger.socket("Block deltas count", {
+          block: block_num,
+          deltas: deltas.length,
+        });
         const processedDeltas = this.processTableDeltas(deltas);
-        this.logger.debug("Processed deltas after filtering", { processed: processedDeltas.length });
+        this.logger.socket("Processed deltas after filtering", {
+          processed: processedDeltas.length,
+        });
         for (const delta of processedDeltas) {
           // Emit context with delta
           this.emit({
@@ -739,7 +889,11 @@ class SocketTester {
         }
       }
     } catch (e) {
-      this.logger.error("Block processing error", { block: block_num, error: e.message, stack: e.stack });
+      this.logger.error("Block processing error", {
+        block: block_num,
+        error: e.message,
+        stack: e.stack,
+      });
     }
   }
 }
@@ -755,19 +909,19 @@ const loggerMicroService = ({
   $logger,
 }: MicroServiceContext) => {
   if ($action) {
-    $logger.info("Action processed", { 
-      block: $block.block_number, 
-      contract: $action.account, 
-      action: $action.name 
+    $logger.micro("Action processed", {
+      block: $block.block_number,
+      contract: $action.account,
+      action: $action.name,
     });
   } else if ($delta) {
-    $logger.info("Delta processed", { 
-      block: $block.block_number, 
+    $logger.micro("Delta processed", {
+      block: $block.block_number,
       table: $table,
-      contract: $delta.contract 
+      contract: $delta.contract,
     });
   } else {
-    $logger.info("Block processed", { block: $block.block_number });
+    $logger.micro("Block processed", {block: $block.block_number});
   }
 
   return {$block, $delta, $action, $table, $logger};
@@ -783,9 +937,9 @@ const transferFilterMicroService = ({
 }: MicroServiceContext) => {
   // Only pass through transfer actions, block everything else
   if ($action && $action.name === "transfer") {
-    $logger.info("Transfer action filtered", { 
-      from: $action.account, 
-      block: $block.block_number 
+    $logger.micro("Transfer action filtered", {
+      from: $action.account,
+      block: $block.block_number,
     });
     return {$block, $delta, $action, $table, $logger};
   }
@@ -803,9 +957,9 @@ const actionTransformMicroService = ({
   $logger,
 }: MicroServiceContext) => {
   if ($action) {
-    $logger.debug("Action transformed", { 
-      action: $action.name, 
-      contract: $action.account 
+    $logger.micro("Action transformed", {
+      action: $action.name,
+      contract: $action.account,
     });
   }
 
@@ -821,12 +975,12 @@ const tableLoggerMicroService = ({
   $logger,
 }: MicroServiceContext) => {
   if ($delta && $table) {
-    $logger.info("Table delta found", { 
-      table: $table, 
+    $logger.micro("Table delta found", {
+      table: $table,
       contract: $delta.contract,
-      block: $block.block_number
+      block: $block.block_number,
     });
-    $logger.debug("Delta details", { delta: $delta });
+    $logger.verbose("Delta details", {delta: $delta});
   }
 
   return {$block, $delta, $action, $table, $logger};
@@ -841,11 +995,28 @@ const tester = new SocketTester({
     futureshit: ["accounts"], // Only accounts table for futureshit
   },
   enableDebug: true, // Enable debug logging to console
-  logFile: "hyperion-client.log" // Log file location
+  logFile: "stream-block-client.log", // Log file location
+  logLevel: "micro", // Only show microservice logs and above (socket logs hidden)
 });
 
 // Chain microservices and start processing
 tester.pipe(tableLoggerMicroService).start();
 
-// For no filtering (process all contracts/tables), use:
-// new SocketTester({socketAddress: WS_SERVER});
+/*
+Log Level Examples:
+
+1. Production (minimal logging):
+   logLevel: "info" - Only info, warn, error
+
+2. Show only microservice activity:
+   logLevel: "micro" - Hide socket-level debugging, show microservice logs
+
+3. Show only socket activity:
+   logLevel: "socket" - Show socket debugging but hide microservice details
+
+4. Show everything:
+   logLevel: "verbose" - All logs including detailed delta structures
+
+5. For no filtering (process all contracts/tables):
+   new SocketTester({socketAddress: WS_SERVER});
+*/
