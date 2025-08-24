@@ -1,7 +1,5 @@
 # XPRNetwork Block Stream Client
 
-> > > > > > > Stashed changes
-
 A powerful, type-safe TypeScript client for streaming real-time blockchain data from XPRNetwork (and other EOSIO chains) using the State History Plugin. Features microservice architecture, ABI decoding, advanced filtering, and structured logging.
 
 ## 🚀 Features
