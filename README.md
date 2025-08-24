@@ -1,4 +1,4 @@
-# hyperion-client
+# Block Stream Client (EOSIO SHiP socket client) 
 
 To install dependencies:
 
