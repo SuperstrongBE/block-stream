@@ -16,16 +16,22 @@ import * as winston from "winston";
 // EOSIO State History types
 interface EOSIOAbi {
   version: string;
-  types: Array<{ new_type_name: string; type: string }>;
+  types: Array<{new_type_name: string; type: string}>;
   structs: Array<{
     name: string;
     base: string;
-    fields: Array<{ name: string; type: string }>;
+    fields: Array<{name: string; type: string}>;
   }>;
-  actions: Array<{ name: string; type: string; ricardian_contract?: string }>;
-  tables: Array<{ name: string; type: string; index_type: string; key_names: string[]; key_types: string[] }>;
-  ricardian_clauses?: Array<{ id: string; body: string }>;
-  variants?: Array<{ name: string; types: string[] }>;
+  actions: Array<{name: string; type: string; ricardian_contract?: string}>;
+  tables: Array<{
+    name: string;
+    type: string;
+    index_type: string;
+    key_names: string[];
+    key_types: string[];
+  }>;
+  ricardian_clauses?: Array<{id: string; body: string}>;
+  variants?: Array<{name: string; types: string[]}>;
 }
 
 interface ContractAbiResponse {
@@ -76,7 +82,7 @@ interface GetBlocksResponse {
 type CustomLogger = winston.Logger & {
   socket(message: string, meta?: any): winston.Logger;
   micro(message: string, meta?: any): winston.Logger;
-}
+};
 
 const txEnc = new TextEncoder();
 const txDec = new TextDecoder();
@@ -129,9 +135,15 @@ interface MicroServiceContext {
 
 type MicroService = (context: MicroServiceContext) => MicroServiceContext;
 
+interface ContractConfig {
+  tables?: string[]; // Array of table names, or ["*"] for all tables
+  actions?: string[]; // Array of action names, undefined means no actions
+}
+
 interface SocketTesterConfig {
   socketAddress: string;
-  contracts?: string[];
+  contracts?: Record<string, ContractConfig>; // New enhanced format
+  // Legacy support (deprecated)
   tables?: Record<string, string[]>;
   enableDebug?: boolean;
   logFile?: string;
@@ -145,7 +157,7 @@ interface SocketTesterConfig {
     | "verbose";
 }
 
-class SocketTester {
+export class BlockStreamClient {
   abi: EOSIOAbi | null = null; // Protocol ABI from State History
   types: SerializationTypes | null = null; // Serialization types from ABI
   tables = new Map<string, string>();
@@ -153,6 +165,8 @@ class SocketTester {
   contractTypes = new Map<string, SerializationTypes>();
   whitelistedContracts = new Set<string>();
   whitelistedTables = new Map<string, Set<string>>(); // Map<contract, Set<table>>
+  whitelistedActions = new Map<string, Set<string>>(); // Map<contract, Set<action>>
+  wildcardTables = new Set<string>(); // Contracts with wildcard table access
   rpc: any = null; // JsonRpc from eosjs - external library without proper types
   receivedCounter: number = 0;
   ws!: WebSocket; // Initialized in start() method
@@ -165,8 +179,8 @@ class SocketTester {
   // Connect to the State-History Plugin
   constructor({
     socketAddress,
-    contracts = [],
-    tables = {},
+    contracts,
+    tables = {}, // Legacy support
     enableDebug = false,
     logFile = "hyperion-client.log",
     logLevel = enableDebug ? "verbose" : "info",
@@ -240,18 +254,64 @@ class SocketTester {
       transports,
     }) as unknown as CustomLogger;
 
-    // Setup contract whitelist
-    this.whitelistedContracts = new Set<string>(contracts);
+    // Initialize whitelists based on configuration format
+    this.initializeWhitelists(contracts, tables);
+  }
 
-    // Setup table whitelist (format: {contract: [table1, table2]})
-    this.whitelistedTables = new Map();
-    Object.entries(tables).forEach(([contract, contractTables]) => {
-      this.whitelistedTables.set(contract, new Set<string>(contractTables));
-    });
+  // Initialize contract, table, and action whitelists
+  private initializeWhitelists(
+    contracts?: Record<string, ContractConfig>,
+    legacyTables?: Record<string, string[]>
+  ): void {
+    if (contracts) {
+      // New enhanced format
+      this.logger.info("Using enhanced contract configuration format");
+      
+      Object.entries(contracts).forEach(([contractName, config]) => {
+        // Add contract to whitelist
+        this.whitelistedContracts.add(contractName);
+        
+        // Handle tables configuration
+        if (config.tables) {
+          if (config.tables.includes("*")) {
+            // Wildcard - allow all tables for this contract
+            this.wildcardTables.add(contractName);
+            this.logger.socket("Contract configured with wildcard table access", { contract: contractName });
+          } else {
+            // Specific tables
+            this.whitelistedTables.set(contractName, new Set(config.tables));
+            this.logger.socket("Contract configured with specific tables", { 
+              contract: contractName, 
+              tables: config.tables 
+            });
+          }
+        }
+        
+        // Handle actions configuration
+        if (config.actions) {
+          this.whitelistedActions.set(contractName, new Set(config.actions));
+          this.logger.socket("Contract configured with specific actions", { 
+            contract: contractName, 
+            actions: config.actions 
+          });
+        }
+      });
+    } else if (legacyTables && Object.keys(legacyTables).length > 0) {
+      // Legacy format support
+      this.logger.warn("Using legacy table configuration format - consider upgrading to enhanced format");
+      
+      Object.entries(legacyTables).forEach(([contract, contractTables]) => {
+        this.whitelistedContracts.add(contract);
+        this.whitelistedTables.set(contract, new Set(contractTables));
+      });
+    } else {
+      // No filtering - process all contracts/tables
+      this.logger.info("No contract filtering configured - processing all contracts and tables");
+    }
   }
 
   // Add microservice to the pipeline
-  pipe(microservice: MicroService): SocketTester {
+  pipe(microservice: MicroService): BlockStreamClient {
     this.microservices.push(microservice);
     return this;
   }
@@ -260,7 +320,8 @@ class SocketTester {
   start(): void {
     this.ws = new WebSocket(this.socketAddress, {perMessageDeflate: false});
     this.ws.on("message", (data: WebSocket.RawData) => {
-      const buffer = data instanceof ArrayBuffer ? Buffer.from(data) : data as Buffer;
+      const buffer =
+        data instanceof ArrayBuffer ? Buffer.from(data) : (data as Buffer);
       this.onMessage(buffer);
     });
 
@@ -357,7 +418,11 @@ class SocketTester {
   }
 
   // Decode table row value using contract ABI
-  decodeTableRowValue(contractName: string, tableName: string, valueData: Record<string, number>): any {
+  decodeTableRowValue(
+    contractName: string,
+    tableName: string,
+    valueData: Record<string, number>
+  ): any {
     try {
       if (!valueData || typeof valueData !== "object") return valueData;
 
@@ -468,17 +533,35 @@ class SocketTester {
 
   // Check if action should be processed based on whitelist
   shouldProcessAction(account: string, name: string): boolean {
-    if (this.whitelistedContracts.size === 0) return true; // No filter = process all
-    return this.whitelistedContracts.has(account);
+    // If no contracts configured, process all
+    if (this.whitelistedContracts.size === 0) return true;
+    
+    // Contract must be whitelisted
+    if (!this.whitelistedContracts.has(account)) return false;
+    
+    // If no specific actions configured for this contract, allow all actions
+    const contractActions = this.whitelistedActions.get(account);
+    if (!contractActions) return true;
+    
+    // Check if specific action is whitelisted
+    return contractActions.has(name);
   }
 
   // Check if table delta should be processed based on whitelist
   shouldProcessTable(contract: string, table: string): boolean {
-    if (this.whitelistedTables.size === 0) return true; // No filter = process all
-
+    // If no contracts configured, process all
+    if (this.whitelistedContracts.size === 0 && this.whitelistedTables.size === 0) return true;
+    
+    // Contract must be whitelisted
+    if (!this.whitelistedContracts.has(contract)) return false;
+    
+    // Check if contract has wildcard table access
+    if (this.wildcardTables.has(contract)) return true;
+    
+    // Check specific table whitelist
     const contractTables = this.whitelistedTables.get(contract);
-    if (!contractTables) return false; // Contract not in whitelist
-
+    if (!contractTables) return true; // Contract whitelisted but no specific tables = allow all
+    
     return contractTables.has(table);
   }
 
@@ -553,7 +636,9 @@ class SocketTester {
 
   // Generic helper to find which whitelisted contract contains this table
   findContractForTable(tableName: string): string | null {
-    for (const [contract, tables] of Array.from(this.whitelistedTables.entries())) {
+    for (const [contract, tables] of Array.from(
+      this.whitelistedTables.entries()
+    )) {
       if (tables.has(tableName)) {
         return contract;
       }
@@ -684,7 +769,11 @@ class SocketTester {
 
   // Report status
 
-  get_status_result_v0(response: { head: any; last_irreversible: any; chain_id: string }): void {
+  get_status_result_v0(response: {
+    head: any;
+    last_irreversible: any;
+    chain_id: string;
+  }): void {
     // request from head block
     this.receivedCounter = 0;
     this.send([
@@ -986,13 +1075,18 @@ const tableLoggerMicroService = ({
   return {$block, $delta, $action, $table, $logger};
 };
 
-// Example usage with microservice architecture
-const tester = new SocketTester({
+// Example usage with enhanced microservice architecture
+const tester = new BlockStreamClient({
   socketAddress: WS_SERVER,
-  contracts: ["eosio", "futureshit"], // Whitelisted contracts
-  tables: {
-    eosio: ["voters"], // Only these tables for eosio
-    futureshit: ["accounts"], // Only accounts table for futureshit
+  contracts: {
+    "eosio": {
+      tables: ["voters"], // Only voters table
+      actions: ["voteproducer"] // Only voteproducer actions
+    },
+    "futureshit": {
+      tables: ["*"], // All tables (wildcard)
+      // No actions specified = no action filtering for this contract
+    }
   },
   enableDebug: true, // Enable debug logging to console
   logFile: "stream-block-client.log", // Log file location
@@ -1003,20 +1097,51 @@ const tester = new SocketTester({
 tester.pipe(tableLoggerMicroService).start();
 
 /*
-Log Level Examples:
+Enhanced Configuration Examples:
 
-1. Production (minimal logging):
-   logLevel: "info" - Only info, warn, error
+1. Specific tables and actions:
+   contracts: {
+     "eosio": {
+       tables: ["voters", "producers"], 
+       actions: ["voteproducer", "regproducer"]
+     }
+   }
 
-2. Show only microservice activity:
-   logLevel: "micro" - Hide socket-level debugging, show microservice logs
+2. All tables, specific actions:
+   contracts: {
+     "mycontract": {
+       tables: ["*"],  // Wildcard = all tables
+       actions: ["transfer", "issue"]
+     }
+   }
 
-3. Show only socket activity:
-   logLevel: "socket" - Show socket debugging but hide microservice details
+3. All tables, no action filtering:
+   contracts: {
+     "anycontract": {
+       tables: ["*"]
+       // No actions property = all actions allowed
+     }
+   }
 
-4. Show everything:
-   logLevel: "verbose" - All logs including detailed delta structures
+4. Specific tables, no action filtering:
+   contracts: {
+     "contract": {
+       tables: ["accounts", "balances"]
+       // No actions property = all actions allowed
+     }
+   }
 
-5. For no filtering (process all contracts/tables):
-   new SocketTester({socketAddress: WS_SERVER});
+5. Legacy format (deprecated):
+   tables: {
+     contract: ["table1", "table2"]
+   }
+
+6. No filtering (process everything):
+   new BlockStreamClient({socketAddress: WS_SERVER});
+
+Log Level Options:
+- "error", "warn", "info": Standard levels
+- "socket": Socket/protocol debugging  
+- "micro": Microservice debugging
+- "debug", "verbose": Detailed debugging
 */
