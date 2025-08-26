@@ -102,5 +102,3 @@ Output for table in micro service (Tested with eosio)
 "filtered": true,
 "extracted_from": "contract_row"
 }
-
-Could you make the value to be a JSON ?
